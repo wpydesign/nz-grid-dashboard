@@ -50,16 +50,21 @@ def load_nz_generation():
 
 @st.cache_data(ttl=3600)
 def load_nz_prices():
-    """Loads last 3 months of NZ Final Energy Prices - AGGRESSIVE FINDER."""
+    """Loads last 3 months of NZ Final Energy Prices - DEEP SCAN."""
     now = pd.Timestamp.now()
+    # Check current month and 2 prior
     months_needed = sorted(list(set([(now - pd.DateOffset(months=i)).strftime('%Y%m') for i in range(3)])))
     all_data = []
     
-    # Try Multiple Paths (EMI sometimes changes structure)
+    # Expanded Paths (EMI changes structure often)
     base_paths = [
         "https://www.emi.ea.govt.nz/Wholesale/Datasets/DispatchAndPricing/FinalEnergyPrices/ByMonth/",
-        "https://www.emi.ea.govt.nz/Wholesale/Datasets/Final_pricing/Final_prices/"
+        "https://www.emi.ea.govt.nz/Wholesale/Datasets/Final_pricing/Final_prices/",
+        "https://www.emi.ea.govt.nz/Wholesale/Datasets/FinalPricing/FinalPrices/",
+        "https://www.emi.ea.govt.nz/Wholesale/Datasets/DispatchAndPricing/FinalEnergyPrices/"
     ]
+    
+    found_data = False
     
     for m in months_needed:
         loaded_month = False
@@ -80,16 +85,21 @@ def load_nz_prices():
                         # Read header
                         df_cols = pd.read_csv(io.StringIO(r.text), nrows=1)
                         
-                        # 1. Look for BEN2201 specifically (Benmore)
+                        # PRIORITY 1: Find BEN2201 (Benmore)
                         price_col = next((c for c in df_cols.columns if 'BEN2201' in c), None)
                         
-                        # 2. If not found, look for ANY column with 'Price' in name (excluding status/date)
+                        # PRIORITY 2: Find 'Reference_Price' or similar
                         if not price_col:
-                            price_col = next((c for c in df_cols.columns if 'price' in c.lower() and 'date' not in c.lower() and 'status' not in c.lower()), None)
+                            # Common patterns in new datasets
+                            candidates = [c for c in df_cols.columns if 'price' in c.lower() and 'date' not in c.lower() and 'status' not in c.lower()]
+                            if candidates:
+                                price_col = candidates[0] # Take first match
                         
-                        # 3. If still not found, look for 'Reference_Price' or similar
+                        # PRIORITY 3: Any numeric column that isn't ID
                         if not price_col:
-                             price_col = next((c for c in df_cols.columns if 'reference' in c.lower()), None)
+                             numeric_cols = df_cols.select_dtypes(include=np.number).columns.tolist()
+                             if numeric_cols:
+                                 price_col = numeric_cols[0] # Desperate fallback
 
                         if price_col:
                             df = pd.read_csv(io.StringIO(r.text), usecols=['Trading_Date', 'Trading_Period', price_col])
@@ -97,12 +107,13 @@ def load_nz_prices():
                             df = df.rename(columns={price_col: 'price'})
                             
                             # Clean
-                            df = df[df['price'] > 0] # Remove negatives/zeros
+                            df = df[df['price'] > 0]
                             df['hour'] = df['datetime'].dt.floor('H')
                             df_hourly = df.groupby('hour')['price'].mean().reset_index()
                             all_data.append(df_hourly)
                             loaded_month = True
-                            break # Found it, move to next month
+                            found_data = True
+                            break 
                 except:
                     continue
     
@@ -145,11 +156,17 @@ def main():
     df = df.dropna(subset=['stress'])
     
     # Merge Prices
-    if df_prices is not None:
+    price_status = "No Price Data"
+    if df_prices is not None and not df_prices.empty:
         df = df.merge(df_prices, on='datetime', how='left')
+        # Check if merge actually brought data
+        if df['spot_price'].notna().sum() > 0:
+            price_status = "OK"
+        else:
+            price_status = "Empty Merge"
     else:
         df['spot_price'] = np.nan
-        st.warning("⚠️ Price data temporarily unavailable (EMI may be updating files).")
+        price_status = "Loader Failed"
     
     # SIDEBAR
     st.sidebar.header("Settings")
@@ -176,7 +193,15 @@ def main():
         st.metric("Status", status)
     with col3:
         price_val = latest['spot_price']
-        st.metric("Current Price ($/MWh)", f"{price_val:.1f}" if pd.notna(price_val) else "N/A")
+        if pd.notna(price_val):
+             st.metric("Current Price ($/MWh)", f"{price_val:.1f}")
+        else:
+             # Try to show last available price
+             last_valid = df['spot_price'].dropna().iloc[-1] if not df['spot_price'].dropna().empty else None
+             if last_valid:
+                 st.metric("Last Price ($/MWh)", f"{last_valid:.1f} (Delayed)")
+             else:
+                 st.metric("Price ($/MWh)", "N/A")
         
     # MAIN CHART
     st.header("Stress Signal vs Threshold")
@@ -193,11 +218,15 @@ def main():
     
     # --- BACKTEST PANEL ---
     st.header("Stress Impact Analysis")
-    st.markdown("**Real historical price premium** when stress > threshold (last 90 days)")
-
-    if 'spot_price' in df.columns and not df['spot_price'].isna().all():
-        high_stress = df[df['stress'] > threshold]
-        normal_stress = df[df['stress'] <= threshold]
+    
+    if price_status == "OK":
+        st.markdown("**Real historical price premium** when stress > threshold.")
+        
+        # Use data where we have both stress and price
+        df_valid = df.dropna(subset=['spot_price'])
+        
+        high_stress = df_valid[df_valid['stress'] > threshold]
+        normal_stress = df_valid[df_valid['stress'] <= threshold]
         
         if not high_stress.empty:
             avg_price_spike = high_stress['spot_price'].mean()
@@ -212,17 +241,23 @@ def main():
                 st.success(f"Price premium during stress events: {premium:.1f}%")
         else:
             st.info("No alerts at this sensitivity level to analyze.")
+            
     else:
-        st.error("Price data unavailable for analysis.")
+        st.warning("Price data unavailable for current analysis.")
+        st.info("Note: EMI price files are often published with a delay. Generation data is live.")
 
     # --- EXPORT BUTTON ---
     st.subheader("Export Data")
     export_df = spikes[['datetime', 'stress', 'spot_price']].dropna()
+    if export_df.empty:
+        # Export full stress history if no alerts
+        export_df = df[['datetime', 'stress', 'spot_price']].dropna()
+        
     if not export_df.empty:
         csv = export_df.to_csv(index=False).encode('utf-8')
-        st.download_button("Download Alert History (CSV)", data=csv, file_name='nz_stress_alerts.csv', mime='text/csv')
+        st.download_button("Download History (CSV)", data=csv, file_name='nz_stress_data.csv', mime='text/csv')
     else:
-        st.info("No alerts to export yet.")
+        st.info("No data to export yet.")
 
     # --- HOW IT WORKS ---
     with st.expander("How It Works (Methodology)"):

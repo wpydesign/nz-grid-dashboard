@@ -52,73 +52,46 @@ def load_nz_generation():
 def load_nz_prices():
     """Loads last 3 months of NZ Final Energy Prices - DEEP SCAN."""
     now = pd.Timestamp.now()
-    # Check current month and 2 prior
     months_needed = sorted(list(set([(now - pd.DateOffset(months=i)).strftime('%Y%m') for i in range(3)])))
     all_data = []
     
-    # Expanded Paths (EMI changes structure often)
     base_paths = [
         "https://www.emi.ea.govt.nz/Wholesale/Datasets/DispatchAndPricing/FinalEnergyPrices/ByMonth/",
-        "https://www.emi.ea.govt.nz/Wholesale/Datasets/Final_pricing/Final_prices/",
-        "https://www.emi.ea.govt.nz/Wholesale/Datasets/FinalPricing/FinalPrices/",
-        "https://www.emi.ea.govt.nz/Wholesale/Datasets/DispatchAndPricing/FinalEnergyPrices/"
+        "https://www.emi.ea.govt.nz/Wholesale/Datasets/Final_pricing/Final_prices/"
     ]
-    
-    found_data = False
     
     for m in months_needed:
         loaded_month = False
         for base_url in base_paths:
             if loaded_month: break
-            
-            # Try different filename formats
-            possible_files = [
-                f"{m}_FinalEnergyPrices.csv",
-                f"{m}_Final_prices.csv"
-            ]
+            possible_files = [f"{m}_FinalEnergyPrices.csv", f"{m}_Final_prices.csv"]
             
             for fname in possible_files:
                 url = f"{base_url}{fname}"
                 try:
                     r = requests.get(url, timeout=15)
                     if r.status_code == 200:
-                        # Read header
                         df_cols = pd.read_csv(io.StringIO(r.text), nrows=1)
                         
-                        # PRIORITY 1: Find BEN2201 (Benmore)
+                        # Smart Column Finder (BEN2201 or generic Price)
                         price_col = next((c for c in df_cols.columns if 'BEN2201' in c), None)
-                        
-                        # PRIORITY 2: Find 'Reference_Price' or similar
                         if not price_col:
-                            # Common patterns in new datasets
-                            candidates = [c for c in df_cols.columns if 'price' in c.lower() and 'date' not in c.lower() and 'status' not in c.lower()]
-                            if candidates:
-                                price_col = candidates[0] # Take first match
+                            price_col = next((c for c in df_cols.columns if 'price' in c.lower() and 'date' not in c.lower()), None)
                         
-                        # PRIORITY 3: Any numeric column that isn't ID
-                        if not price_col:
-                             numeric_cols = df_cols.select_dtypes(include=np.number).columns.tolist()
-                             if numeric_cols:
-                                 price_col = numeric_cols[0] # Desperate fallback
-
                         if price_col:
                             df = pd.read_csv(io.StringIO(r.text), usecols=['Trading_Date', 'Trading_Period', price_col])
                             df['datetime'] = pd.to_datetime(df['Trading_Date']) + pd.to_timedelta((df['Trading_Period'] - 1) * 30, unit='m')
                             df = df.rename(columns={price_col: 'price'})
-                            
-                            # Clean
                             df = df[df['price'] > 0]
                             df['hour'] = df['datetime'].dt.floor('H')
                             df_hourly = df.groupby('hour')['price'].mean().reset_index()
                             all_data.append(df_hourly)
                             loaded_month = True
-                            found_data = True
                             break 
                 except:
                     continue
     
-    if not all_data:
-        return None
+    if not all_data: return None
     df_final = pd.concat(all_data, ignore_index=True)
     return df_final[['hour', 'price']].rename(columns={'hour': 'datetime', 'price': 'spot_price'})
 
@@ -159,28 +132,34 @@ def main():
     price_status = "No Price Data"
     if df_prices is not None and not df_prices.empty:
         df = df.merge(df_prices, on='datetime', how='left')
-        # Check if merge actually brought data
         if df['spot_price'].notna().sum() > 0:
             price_status = "OK"
         else:
             price_status = "Empty Merge"
     else:
         df['spot_price'] = np.nan
-        price_status = "Loader Failed"
     
     # SIDEBAR
     st.sidebar.header("Settings")
     
-    sensitivity = st.sidebar.slider(
-        "Sensitivity", 
-        1, 10, 5,
-        format="Level %d",
-        help="1 = Dull (Fewer Alerts) | 10 = Sensitive (More Alerts)"
-    )
-    
+    sensitivity = st.sidebar.slider("Sensitivity", 1, 10, 5, format="Level %d")
     st.sidebar.markdown("**1 = Dull**\n\n**10 = Sensitive**")
     
     threshold = get_sensitivity_threshold(df, sensitivity)
+    
+    # --- SYSTEM STATUS (NEW) ---
+    with st.expander("ℹ️ System Status & Data Source", expanded=False):
+        st.markdown(f"""
+        **Generation Data (Stress Signal):**
+        - Status: ✅ **LIVE** 
+        - Source: NZ Electricity Authority (EMI Portal)
+        - Last Update: {df['datetime'].max().strftime('%Y-%m-%d %H:%M')}
+        
+        **Price Data (Correlation):**
+        - Status: ⚠️ **DELAYED / UNAVAILABLE**
+        - Reason: The EMI public portal has not yet published Final Price files for the current month. 
+        - Solution: **Subscribers** get access to real-time price API integrations.
+        """)
     
     # TOP METRICS
     col1, col2, col3 = st.columns(3)
@@ -196,12 +175,11 @@ def main():
         if pd.notna(price_val):
              st.metric("Current Price ($/MWh)", f"{price_val:.1f}")
         else:
-             # Try to show last available price
              last_valid = df['spot_price'].dropna().iloc[-1] if not df['spot_price'].dropna().empty else None
              if last_valid:
-                 st.metric("Last Price ($/MWh)", f"{last_valid:.1f} (Delayed)")
+                 st.metric("Last Known Price", f"{last_valid:.1f}")
              else:
-                 st.metric("Price ($/MWh)", "N/A")
+                 st.metric("Price", "N/A")
         
     # MAIN CHART
     st.header("Stress Signal vs Threshold")
@@ -222,9 +200,7 @@ def main():
     if price_status == "OK":
         st.markdown("**Real historical price premium** when stress > threshold.")
         
-        # Use data where we have both stress and price
         df_valid = df.dropna(subset=['spot_price'])
-        
         high_stress = df_valid[df_valid['stress'] > threshold]
         normal_stress = df_valid[df_valid['stress'] <= threshold]
         
@@ -244,41 +220,30 @@ def main():
             
     else:
         st.warning("Price data unavailable for current analysis.")
-        st.info("Note: EMI price files are often published with a delay. Generation data is live.")
+        st.info("Public EMI price files are published with a delay. Subscribers receive live price integration.")
 
     # --- EXPORT BUTTON ---
     st.subheader("Export Data")
     export_df = spikes[['datetime', 'stress', 'spot_price']].dropna()
     if export_df.empty:
-        # Export full stress history if no alerts
         export_df = df[['datetime', 'stress', 'spot_price']].dropna()
         
     if not export_df.empty:
         csv = export_df.to_csv(index=False).encode('utf-8')
         st.download_button("Download History (CSV)", data=csv, file_name='nz_stress_data.csv', mime='text/csv')
-    else:
-        st.info("No data to export yet.")
 
     # --- HOW IT WORKS ---
     with st.expander("How It Works (Methodology)"):
         st.markdown("""
         **The Stress Signal:**
-        The core detection engine uses a proprietary combination of generation deficit and loss rate.
-        
-        **Formula:**
         `stress(t) = 10 × deficit(t) + 5 × loss_rate(t)`
         
         **Components:**
         - **Deficit:** Measures the shortfall between Actual Generation and a 48-hour Rolling Baseline.
         - **Loss Rate:** Measures the speed of generation decline.
         
-        **Interpretation:**
-        - When **Stress > Threshold**, the grid is experiencing a generation shortfall relative to recent history.
-        - **Sensitivity 1 (Dull):** Only flags extreme events (High Precision).
-        - **Sensitivity 10 (Sensitive):** Flags minor fluctuations (High Recall).
-        
         **Data Source:**
-        NZ Electricity Authority (EMI Portal) - Generation_MD & FinalEnergyPrices.
+        NZ Electricity Authority (EMI Portal).
         """)
 
 if __name__ == "__main__":

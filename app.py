@@ -11,7 +11,7 @@ st.set_page_config(page_title="NZ Grid Stress Monitor", layout="wide")
 # --- 1. DATA LOADING ---
 
 @st.cache_data(ttl=3600)
-def load_nz_data():
+def load_nz_generation():
     """Loads last 90 days of NZ generation data."""
     now = pd.Timestamp.now()
     months_needed = []
@@ -53,44 +53,42 @@ def load_nz_data():
 
 @st.cache_data(ttl=3600)
 def load_nz_prices():
-    """Loads last 90 days of NZ Final Prices (Benmore Reference)."""
+    """Loads last 30 days of NZ Final Energy Prices (Benmore BEN2201)."""
     now = pd.Timestamp.now()
-    months_needed = [(now - pd.DateOffset(months=i)).strftime('%Y%m') for i in range(3)]
-    
+    # Load last 30 days (to prevent timeouts on free tier)
+    dates_needed = [now - pd.DateOffset(days=i) for i in range(30)]
     all_data = []
-    base_url = "https://www.emi.ea.govt.nz/Wholesale/Datasets/Final_pricing/Final_prices/"
+    base_url = "https://www.emi.ea.govt.nz/Wholesale/Datasets/DispatchAndPricing/FinalEnergyPrices/"
     
-    for m in sorted(set(months_needed)):
-        url = f"{base_url}{m}_Final_prices.csv"
+    progress_bar = st.progress(0, text="Loading price data...")
+    
+    for i, d in enumerate(dates_needed):
+        filename = d.strftime('%Y%m%d_FinalEnergyPrices.csv')
+        url = f"{base_url}{filename}"
         try:
-            r = requests.get(url, timeout=30)
+            r = requests.get(url, timeout=10)
             if r.status_code == 200:
-                # Read only first 10 rows to get columns (optimization)
+                # Read header first to find column
                 df_cols = pd.read_csv(io.StringIO(r.text), nrows=1)
-                
-                # Find Benmore Column (BEN2201) and Date/Period cols
-                target_cols = ['Trading_Date', 'Trading_Period']
                 price_col = next((c for c in df_cols.columns if 'BEN2201' in c), None)
                 
                 if price_col:
-                    target_cols.append(price_col)
-                    
-                    # Read specific columns only (saves RAM)
-                    df = pd.read_csv(io.StringIO(r.text), usecols=target_cols)
-                    df['datetime'] = pd.to_datetime(df['Trading_Date']) + pd.to_timedelta((df['Trading_Period']-1)*30, unit='m')
+                    # Read only specific columns to save RAM
+                    df = pd.read_csv(io.StringIO(r.text), usecols=['Trading_Date', 'Trading_Period', price_col])
+                    df['datetime'] = pd.to_datetime(df['Trading_Date']) + pd.to_timedelta((df['Trading_Period'] - 1) * 30, unit='m')
                     df = df.rename(columns={price_col: 'price'})
-                    
-                    # Filter invalid prices
-                    df = df[df['price'] > -100] 
-                    
+                    df = df[df['price'] > 0] # Filter invalid prices
                     df['hour'] = df['datetime'].dt.floor('H')
                     df_hourly = df.groupby('hour')['price'].mean().reset_index()
                     all_data.append(df_hourly)
-        except Exception as e:
-            # st.write(f"Error loading price {m}: {e}") # Debug
-            continue
-            
-    if not all_data: return None
+        except:
+            continue # Skip missing days silently
+        progress_bar.progress((i+1) / len(dates_needed), text=f"Checking {d.strftime('%Y-%m-%d')}...")
+    
+    progress_bar.empty()
+    
+    if not all_data:
+        return None
     df_final = pd.concat(all_data, ignore_index=True)
     return df_final[['hour', 'price']].rename(columns={'hour': 'datetime', 'price': 'spot_price'})
 
@@ -107,14 +105,9 @@ def calculate_stress_signal(df, gen_col='generation_mw'):
 def get_sensitivity_threshold(df, level):
     mean = df['stress'].mean()
     std = df['stress'].std()
+    # Map 1-10 to Z-score 3.5 down to 0.5
     z = 3.5 - ((level - 1) * (3.0 / 9))
     return mean + (z * std)
-
-def classify_event(avg_loss, avg_deficit):
-    if avg_loss > 0.005:
-        return "Acute (Trip/Outage)"
-    else:
-        return "Systemic (Fuel/Shortage)"
 
 # --- 3. DASHBOARD UI ---
 
@@ -122,27 +115,37 @@ def main():
     st.title("🇳🇿 NZ Grid Stress Monitor – Trader Edition")
     st.caption("Live generation-deficit signal • Sensitivity slider • Real price correlation")
     
-    with st.spinner("Fetching latest grid & price data..."):
-        df = load_nz_data()
-        prices_df = load_nz_prices()
+    # Load Data
+    df_gen = load_nz_generation()
+    df_prices = load_nz_prices()
     
-    if df is None:
+    if df_gen is None:
         st.error("Failed to load generation data.")
         return
         
-    df = calculate_stress_signal(df)
+    df = calculate_stress_signal(df_gen)
     df = df.dropna(subset=['stress'])
     
     # Merge Prices
-    if prices_df is not None:
-        df = df.merge(prices_df, on='datetime', how='left')
+    if df_prices is not None:
+        df = df.merge(df_prices, on='datetime', how='left')
     else:
         df['spot_price'] = np.nan
+        st.warning("Could not load live price data (EMI server might be updating).")
     
     # SIDEBAR
     st.sidebar.header("Settings")
-    sensitivity = st.sidebar.slider("Sensitivity", 1, 10, 5, 
-                                    help="1=Low Noise (Traders), 10=High Recall (Analysts)")
+    
+    # Polished Slider
+    sensitivity = st.sidebar.slider(
+        "Sensitivity", 
+        1, 10, 5,
+        format="Level %d",
+        help="1 = Dull (High Certainty) | 10 = Sensitive (High Recall)"
+    )
+    
+    # Add labels for clarity
+    st.sidebar.markdown("**1 = Dull (Traders)**\n\n**10 = Sensitive (Analysts)**")
     
     threshold = get_sensitivity_threshold(df, sensitivity)
     
@@ -156,7 +159,8 @@ def main():
         status = "⚠️ STRESS ALERT" if latest['stress'] > threshold else "✅ NORMAL"
         st.metric("Status", status)
     with col3:
-        st.metric("Current Price ($/MWh)", f"{latest['spot_price']:.1f}" if pd.notna(latest['spot_price']) else "N/A")
+        price_val = latest['spot_price']
+        st.metric("Current Price ($/MWh)", f"{price_val:.1f}" if pd.notna(price_val) else "N/A")
         
     # MAIN CHART
     st.header("Stress Signal vs Threshold")
@@ -176,7 +180,7 @@ def main():
     ))
     
     # Spikes
-    spikes = df[df['stress'] > threshold]
+    spikes = df[df['stress'] > threshold].copy()
     fig.add_trace(go.Scatter(
         x=spikes['datetime'], y=spikes['stress'],
         mode='markers', name='Alert', marker=dict(color='red', size=8)
@@ -185,32 +189,35 @@ def main():
     fig.update_layout(template="plotly_white", height=400, hovermode="x unified")
     st.plotly_chart(fig, use_container_width=True)
     
-    # --- NEW: BACKTEST PANEL ---
+    # --- BACKTEST PANEL ---
     st.header("Stress Impact Analysis")
-    st.markdown("**Real historical price premium** when stress > threshold (last 90 days)")
+    st.markdown("**Real historical price premium** when stress > threshold (last 30 days)")
 
-    high_stress = df[df['stress'] > threshold]
-    normal_stress = df[df['stress'] <= threshold]
-    
-    if not high_stress.empty and 'spot_price' in df.columns and not high_stress['spot_price'].isna().all():
-        avg_price_spike = high_stress['spot_price'].mean()
-        avg_price_norm = normal_stress['spot_price'].mean()
+    if 'spot_price' in df.columns and not df['spot_price'].isna().all():
+        high_stress = df[df['stress'] > threshold]
+        normal_stress = df[df['stress'] <= threshold]
         
-        c1, c2 = st.columns(2)
-        with c1:
-            st.metric("Avg Price (During Alert)", f"${avg_price_spike:.1f}")
-        with c2:
-            st.metric("Avg Price (Normal)", f"${avg_price_norm:.1f}")
+        if not high_stress.empty:
+            avg_price_spike = high_stress['spot_price'].mean()
+            avg_price_norm = normal_stress['spot_price'].mean()
             
-        if avg_price_norm > 0:
-            premium = ((avg_price_spike - avg_price_norm) / avg_price_norm * 100)
-            st.success(f"Price premium during stress events: {premium:.1f}%")
+            c1, c2 = st.columns(2)
+            with c1:
+                st.metric("Avg Price (During Alert)", f"${avg_price_spike:.1f}")
+            with c2:
+                st.metric("Avg Price (Normal)", f"${avg_price_norm:.1f}")
+                
+            if avg_price_norm > 0:
+                premium = ((avg_price_spike - avg_price_norm) / avg_price_norm * 100)
+                st.success(f"Price premium during stress events: {premium:.1f}%")
+        else:
+            st.info("No alerts at this sensitivity level to analyze.")
     else:
-        st.info("No price data available or no alerts at this sensitivity.")
+        st.error("Price data unavailable for analysis.")
 
-    # --- NEW: EXPORT BUTTON ---
+    # --- EXPORT BUTTON ---
     st.subheader("Export Data")
-    csv = spikes[['datetime', 'stress', 'spot_price']].to_csv(index=False).encode('utf-8')
+    csv = spikes[['datetime', 'stress', 'spot_price']].dropna().to_csv(index=False).encode('utf-8')
     st.download_button(
         "Download Alert History (CSV)",
         data=csv,

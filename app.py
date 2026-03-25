@@ -28,7 +28,6 @@ def load_nz_data():
             r = requests.get(url, timeout=20)
             if r.status_code == 200:
                 df = pd.read_csv(io.StringIO(r.text), low_memory=False)
-                # Robust Date Handling
                 date_col = next((c for c in df.columns if 'date' in c.lower()), None)
                 if date_col: df['Trading_Date'] = pd.to_datetime(df[date_col])
                 all_data.append(df)
@@ -51,6 +50,49 @@ def load_nz_data():
     df_hourly.columns = ['datetime', 'generation_mw']
     
     return df_hourly
+
+@st.cache_data(ttl=3600)
+def load_nz_prices():
+    """Loads last 90 days of NZ Final Prices (Benmore Reference)."""
+    now = pd.Timestamp.now()
+    months_needed = [(now - pd.DateOffset(months=i)).strftime('%Y%m') for i in range(3)]
+    
+    all_data = []
+    base_url = "https://www.emi.ea.govt.nz/Wholesale/Datasets/Final_pricing/Final_prices/"
+    
+    for m in sorted(set(months_needed)):
+        url = f"{base_url}{m}_Final_prices.csv"
+        try:
+            r = requests.get(url, timeout=30)
+            if r.status_code == 200:
+                # Read only first 10 rows to get columns (optimization)
+                df_cols = pd.read_csv(io.StringIO(r.text), nrows=1)
+                
+                # Find Benmore Column (BEN2201) and Date/Period cols
+                target_cols = ['Trading_Date', 'Trading_Period']
+                price_col = next((c for c in df_cols.columns if 'BEN2201' in c), None)
+                
+                if price_col:
+                    target_cols.append(price_col)
+                    
+                    # Read specific columns only (saves RAM)
+                    df = pd.read_csv(io.StringIO(r.text), usecols=target_cols)
+                    df['datetime'] = pd.to_datetime(df['Trading_Date']) + pd.to_timedelta((df['Trading_Period']-1)*30, unit='m')
+                    df = df.rename(columns={price_col: 'price'})
+                    
+                    # Filter invalid prices
+                    df = df[df['price'] > -100] 
+                    
+                    df['hour'] = df['datetime'].dt.floor('H')
+                    df_hourly = df.groupby('hour')['price'].mean().reset_index()
+                    all_data.append(df_hourly)
+        except Exception as e:
+            # st.write(f"Error loading price {m}: {e}") # Debug
+            continue
+            
+    if not all_data: return None
+    df_final = pd.concat(all_data, ignore_index=True)
+    return df_final[['hour', 'price']].rename(columns={'hour': 'datetime', 'price': 'spot_price'})
 
 # --- 2. CORE LOGIC ---
 
@@ -77,17 +119,25 @@ def classify_event(avg_loss, avg_deficit):
 # --- 3. DASHBOARD UI ---
 
 def main():
-    st.title("🇳🇿 NZ Grid Stress Monitor")
+    st.title("🇳🇿 NZ Grid Stress Monitor – Trader Edition")
+    st.caption("Live generation-deficit signal • Sensitivity slider • Real price correlation")
     
-    with st.spinner("Fetching latest grid data (Last 90 days)..."):
+    with st.spinner("Fetching latest grid & price data..."):
         df = load_nz_data()
+        prices_df = load_nz_prices()
     
     if df is None:
-        st.error("Failed to load data.")
+        st.error("Failed to load generation data.")
         return
         
     df = calculate_stress_signal(df)
     df = df.dropna(subset=['stress'])
+    
+    # Merge Prices
+    if prices_df is not None:
+        df = df.merge(prices_df, on='datetime', how='left')
+    else:
+        df['spot_price'] = np.nan
     
     # SIDEBAR
     st.sidebar.header("Settings")
@@ -106,36 +156,45 @@ def main():
         status = "⚠️ STRESS ALERT" if latest['stress'] > threshold else "✅ NORMAL"
         st.metric("Status", status)
     with col3:
-        st.metric("Threshold", f"{threshold:.2f}")
+        st.metric("Current Price ($/MWh)", f"{latest['spot_price']:.1f}" if pd.notna(latest['spot_price']) else "N/A")
         
     # MAIN CHART
     st.header("Stress Signal vs Threshold")
     
     fig = go.Figure()
-    fig.add_trace(go.Scatter(x=df['datetime'], y=df['stress'], mode='lines', name='Stress', line=dict(color='#1f77b4')))
-    fig.add_trace(go.Scatter(x=df['datetime'], y=[threshold]*len(df), mode='lines', name='Threshold', line=dict(color='red', dash='dash')))
     
-    # Highlight Spikes
+    # Stress Line
+    fig.add_trace(go.Scatter(
+        x=df['datetime'], y=df['stress'],
+        mode='lines', name='Stress', line=dict(color='#1f77b4', width=2)
+    ))
+    
+    # Threshold Line
+    fig.add_trace(go.Scatter(
+        x=df['datetime'], y=[threshold]*len(df),
+        mode='lines', name='Threshold', line=dict(color='red', dash='dash')
+    ))
+    
+    # Spikes
     spikes = df[df['stress'] > threshold]
-    fig.add_trace(go.Scatter(x=spikes['datetime'], y=spikes['stress'], mode='markers', name='Alert', marker=dict(color='red', size=8)))
+    fig.add_trace(go.Scatter(
+        x=spikes['datetime'], y=spikes['stress'],
+        mode='markers', name='Alert', marker=dict(color='red', size=8)
+    ))
     
     fig.update_layout(template="plotly_white", height=400, hovermode="x unified")
     st.plotly_chart(fig, use_container_width=True)
     
-    # BACKTEST PANEL
+    # --- NEW: BACKTEST PANEL ---
     st.header("Stress Impact Analysis")
-    st.markdown("Simulated analysis of what happens to prices when stress > threshold.")
-    
-    # Simulate Price Proxy (since we don't have live price API here)
-    np.random.seed(42)
-    df['price_proxy'] = 100 + (df['stress'] * 20) + np.random.normal(0, 10, len(df))
-    
+    st.markdown("**Real historical price premium** when stress > threshold (last 90 days)")
+
     high_stress = df[df['stress'] > threshold]
     normal_stress = df[df['stress'] <= threshold]
     
-    if not high_stress.empty:
-        avg_price_spike = high_stress['price_proxy'].mean()
-        avg_price_norm = normal_stress['price_proxy'].mean()
+    if not high_stress.empty and 'spot_price' in df.columns and not high_stress['spot_price'].isna().all():
+        avg_price_spike = high_stress['spot_price'].mean()
+        avg_price_norm = normal_stress['spot_price'].mean()
         
         c1, c2 = st.columns(2)
         with c1:
@@ -143,9 +202,21 @@ def main():
         with c2:
             st.metric("Avg Price (Normal)", f"${avg_price_norm:.1f}")
             
-        st.success(f"Price premium during stress events: {(avg_price_spike - avg_price_norm):.1f}%")
+        if avg_price_norm > 0:
+            premium = ((avg_price_spike - avg_price_norm) / avg_price_norm * 100)
+            st.success(f"Price premium during stress events: {premium:.1f}%")
     else:
-        st.info("No stress events detected at this sensitivity to analyze.")
+        st.info("No price data available or no alerts at this sensitivity.")
+
+    # --- NEW: EXPORT BUTTON ---
+    st.subheader("Export Data")
+    csv = spikes[['datetime', 'stress', 'spot_price']].to_csv(index=False).encode('utf-8')
+    st.download_button(
+        "Download Alert History (CSV)",
+        data=csv,
+        file_name='nz_stress_alerts.csv',
+        mime='text/csv',
+    )
 
 if __name__ == "__main__":
     main()

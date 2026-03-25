@@ -53,13 +53,14 @@ def load_nz_generation():
 
 @st.cache_data(ttl=3600)
 def load_nz_prices():
-    """Loads last 30 days of NZ Final Energy Prices (Benmore BEN2201)."""
+    """Loads last 30 days of NZ Final Energy Prices."""
     now = pd.Timestamp.now()
-    # Load last 30 days (to prevent timeouts on free tier)
+    # Load last 30 days
     dates_needed = [now - pd.DateOffset(days=i) for i in range(30)]
     all_data = []
     base_url = "https://www.emi.ea.govt.nz/Wholesale/Datasets/DispatchAndPricing/FinalEnergyPrices/"
     
+    # Progress bar for user experience
     progress_bar = st.progress(0, text="Loading price data...")
     
     for i, d in enumerate(dates_needed):
@@ -68,21 +69,33 @@ def load_nz_prices():
         try:
             r = requests.get(url, timeout=10)
             if r.status_code == 200:
-                # Read header first to find column
+                # Read header to find columns
                 df_cols = pd.read_csv(io.StringIO(r.text), nrows=1)
-                price_col = next((c for c in df_cols.columns if 'BEN2201' in c), None)
+                
+                # Try to find the Benmore column (BEN2201) or fall back to a generic 'Price' column if exists
+                # Common columns: BEN2201, BEN2202, or sometimes just 'Price' in reference files
+                price_col = None
+                possible_cols = ['BEN2201', 'BEN2202', 'Price', 'Price_BEN']
+                for pc in possible_cols:
+                    if pc in df_cols.columns:
+                        price_col = pc
+                        break
+                
+                # If still not found, try partial match for BEN
+                if not price_col:
+                    price_col = next((c for c in df_cols.columns if 'BEN' in c), None)
                 
                 if price_col:
-                    # Read only specific columns to save RAM
+                    # Read only necessary columns
                     df = pd.read_csv(io.StringIO(r.text), usecols=['Trading_Date', 'Trading_Period', price_col])
                     df['datetime'] = pd.to_datetime(df['Trading_Date']) + pd.to_timedelta((df['Trading_Period'] - 1) * 30, unit='m')
                     df = df.rename(columns={price_col: 'price'})
-                    df = df[df['price'] > 0] # Filter invalid prices
+                    df = df[df['price'] > 0] # Filter invalid
                     df['hour'] = df['datetime'].dt.floor('H')
                     df_hourly = df.groupby('hour')['price'].mean().reset_index()
                     all_data.append(df_hourly)
         except:
-            continue # Skip missing days silently
+            continue
         progress_bar.progress((i+1) / len(dates_needed), text=f"Checking {d.strftime('%Y-%m-%d')}...")
     
     progress_bar.empty()
@@ -136,16 +149,15 @@ def main():
     # SIDEBAR
     st.sidebar.header("Settings")
     
-    # Polished Slider
+    # Polished Slider (Fixed Labels)
     sensitivity = st.sidebar.slider(
         "Sensitivity", 
         1, 10, 5,
         format="Level %d",
-        help="1 = Dull (High Certainty) | 10 = Sensitive (High Recall)"
+        help="1 = Dull (Fewer Alerts) | 10 = Sensitive (More Alerts)"
     )
     
-    # Add labels for clarity
-    st.sidebar.markdown("**1 = Dull (Traders)**\n\n**10 = Sensitive (Analysts)**")
+    st.sidebar.markdown("**1 = Dull**\n\n**10 = Sensitive**")
     
     threshold = get_sensitivity_threshold(df, sensitivity)
     
@@ -217,13 +229,40 @@ def main():
 
     # --- EXPORT BUTTON ---
     st.subheader("Export Data")
-    csv = spikes[['datetime', 'stress', 'spot_price']].dropna().to_csv(index=False).encode('utf-8')
-    st.download_button(
-        "Download Alert History (CSV)",
-        data=csv,
-        file_name='nz_stress_alerts.csv',
-        mime='text/csv',
-    )
+    # Only export if we have data
+    export_df = spikes[['datetime', 'stress', 'spot_price']].dropna()
+    if not export_df.empty:
+        csv = export_df.to_csv(index=False).encode('utf-8')
+        st.download_button(
+            "Download Alert History (CSV)",
+            data=csv,
+            file_name='nz_stress_alerts.csv',
+            mime='text/csv',
+        )
+    else:
+        st.info("No alerts to export yet.")
+
+    # --- HOW IT WORKS (New Section) ---
+    with st.expander("How It Works (Methodology)"):
+        st.markdown("""
+        **The Stress Signal:**
+        The core detection engine uses a proprietary combination of generation deficit and loss rate.
+        
+        **Formula:**
+        `stress(t) = 10 × deficit(t) + 5 × loss_rate(t)`
+        
+        **Components:**
+        - **Deficit:** Measures the shortfall between Actual Generation and a 48-hour Rolling Baseline.
+        - **Loss Rate:** Measures the speed of generation decline.
+        
+        **Interpretation:**
+        - When **Stress > Threshold**, the grid is experiencing a generation shortfall relative to recent history.
+        - **Sensitivity 1 (Dull):** Only flags extreme events (High Precision).
+        - **Sensitivity 10 (Sensitive):** Flags minor fluctuations (High Recall).
+        
+        **Data Source:**
+        NZ Electricity Authority (EMI Portal) - Generation_MD & FinalEnergyPrices.
+        """)
 
 if __name__ == "__main__":
     main()

@@ -14,15 +14,12 @@ st.set_page_config(page_title="NZ Grid Stress Monitor", layout="wide")
 def load_nz_generation():
     """Loads last 3 months of NZ generation data."""
     now = pd.Timestamp.now()
-    months_needed = []
-    for i in range(3):
-        m_date = now - pd.DateOffset(months=i)
-        months_needed.append(m_date.strftime('%Y%m'))
+    months_needed = sorted(list(set([(now - pd.DateOffset(months=i)).strftime('%Y%m') for i in range(3)])))
     
     all_data = []
     base_url = "https://emi.ea.govt.nz/Wholesale/Datasets/Generation/Generation_MD/"
     
-    for m in sorted(list(set(months_needed))):
+    for m in months_needed:
         url = f"{base_url}{m}_Generation_MD.csv"
         try:
             r = requests.get(url, timeout=20)
@@ -53,54 +50,61 @@ def load_nz_generation():
 
 @st.cache_data(ttl=3600)
 def load_nz_prices():
-    """Loads last 3 months of NZ Final Energy Prices using MONTHLY files."""
+    """Loads last 3 months of NZ Final Energy Prices - AGGRESSIVE FINDER."""
     now = pd.Timestamp.now()
-    months_needed = []
-    for i in range(3):
-        m_date = now - pd.DateOffset(months=i)
-        months_needed.append(m_date.strftime('%Y%m'))
-        
+    months_needed = sorted(list(set([(now - pd.DateOffset(months=i)).strftime('%Y%m') for i in range(3)])))
     all_data = []
-    # CORRECT URL: Using ByMonth folder which has reliable files
-    base_url = "https://www.emi.ea.govt.nz/Wholesale/Datasets/DispatchAndPricing/FinalEnergyPrices/ByMonth/"
     
-    for m in sorted(list(set(months_needed))):
-        # Filename format: 202603_FinalEnergyPrices.csv
-        filename = f"{m}_FinalEnergyPrices.csv"
-        url = f"{base_url}{filename}"
-        
-        try:
-            r = requests.get(url, timeout=30)
-            if r.status_code == 200:
-                # Read header
-                df_cols = pd.read_csv(io.StringIO(r.text), nrows=1)
-                
-                # Find Price Column (BEN2201 is Benmore, the reference node)
-                price_col = next((c for c in df_cols.columns if 'BEN2201' in c), None)
-                
-                # If BEN2201 not found, try finding ANY price column (fallback)
-                if not price_col:
-                     # Look for columns containing "Price" but not "Status" or "Date"
-                     price_col = next((c for c in df_cols.columns if 'price' in c.lower() and 'date' not in c.lower() and 'status' not in c.lower()), None)
+    # Try Multiple Paths (EMI sometimes changes structure)
+    base_paths = [
+        "https://www.emi.ea.govt.nz/Wholesale/Datasets/DispatchAndPricing/FinalEnergyPrices/ByMonth/",
+        "https://www.emi.ea.govt.nz/Wholesale/Datasets/Final_pricing/Final_prices/"
+    ]
+    
+    for m in months_needed:
+        loaded_month = False
+        for base_url in base_paths:
+            if loaded_month: break
+            
+            # Try different filename formats
+            possible_files = [
+                f"{m}_FinalEnergyPrices.csv",
+                f"{m}_Final_prices.csv"
+            ]
+            
+            for fname in possible_files:
+                url = f"{base_url}{fname}"
+                try:
+                    r = requests.get(url, timeout=15)
+                    if r.status_code == 200:
+                        # Read header
+                        df_cols = pd.read_csv(io.StringIO(r.text), nrows=1)
+                        
+                        # 1. Look for BEN2201 specifically (Benmore)
+                        price_col = next((c for c in df_cols.columns if 'BEN2201' in c), None)
+                        
+                        # 2. If not found, look for ANY column with 'Price' in name (excluding status/date)
+                        if not price_col:
+                            price_col = next((c for c in df_cols.columns if 'price' in c.lower() and 'date' not in c.lower() and 'status' not in c.lower()), None)
+                        
+                        # 3. If still not found, look for 'Reference_Price' or similar
+                        if not price_col:
+                             price_col = next((c for c in df_cols.columns if 'reference' in c.lower()), None)
 
-                if price_col:
-                    # Read only what we need
-                    df = pd.read_csv(io.StringIO(r.text), usecols=['Trading_Date', 'Trading_Period', price_col])
-                    df['datetime'] = pd.to_datetime(df['Trading_Date']) + pd.to_timedelta((df['Trading_Period'] - 1) * 30, unit='m')
-                    df = df.rename(columns={price_col: 'price'})
-                    
-                    # Clean
-                    df = df[df['price'] > 0]
-                    df['hour'] = df['datetime'].dt.floor('H')
-                    df_hourly = df.groupby('hour')['price'].mean().reset_index()
-                    all_data.append(df_hourly)
-                else:
-                    st.warning(f"Price column not found in {filename}")
-            else:
-                st.warning(f"File not found: {filename} (Status: {r.status_code})")
-        except Exception as e:
-            st.warning(f"Error loading {m}: {e}")
-            continue
+                        if price_col:
+                            df = pd.read_csv(io.StringIO(r.text), usecols=['Trading_Date', 'Trading_Period', price_col])
+                            df['datetime'] = pd.to_datetime(df['Trading_Date']) + pd.to_timedelta((df['Trading_Period'] - 1) * 30, unit='m')
+                            df = df.rename(columns={price_col: 'price'})
+                            
+                            # Clean
+                            df = df[df['price'] > 0] # Remove negatives/zeros
+                            df['hour'] = df['datetime'].dt.floor('H')
+                            df_hourly = df.groupby('hour')['price'].mean().reset_index()
+                            all_data.append(df_hourly)
+                            loaded_month = True
+                            break # Found it, move to next month
+                except:
+                    continue
     
     if not all_data:
         return None
@@ -131,17 +135,6 @@ def main():
     
     # Load Data
     df_gen = load_nz_generation()
-    
-    # Debug Mode
-    if st.sidebar.checkbox("Show Data Loader Debug"):
-        st.subheader("Debug: Price Loader Output")
-        df_prices_debug = load_nz_prices()
-        if df_prices_debug is not None:
-            st.success(f"Loaded {len(df_prices_debug)} price records.")
-            st.dataframe(df_prices_debug.head())
-        else:
-            st.error("Price loader returned None.")
-
     df_prices = load_nz_prices()
     
     if df_gen is None:

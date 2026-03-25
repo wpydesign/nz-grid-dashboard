@@ -5,263 +5,200 @@ import requests
 import io
 import plotly.graph_objects as go
 
-# --- CONFIGURATION ---
 st.set_page_config(page_title="NZ Grid Stress Monitor", layout="wide")
 
-# --- 1. DATA LOADING ---
-
+# ==================== DATA LOADING ====================
 @st.cache_data(ttl=3600)
 def load_nz_generation():
-    """Loads last 90 days of NZ generation data."""
+    """Loads last 90 days of generation data."""
     now = pd.Timestamp.now()
-    months_needed = []
-    for i in range(3):
-        m_date = now - pd.DateOffset(months=i)
-        months_needed.append(m_date.strftime('%Y%m'))
-    
+    months_needed = [(now - pd.DateOffset(months=i)).strftime('%Y%m') for i in range(3)]
     all_data = []
     base_url = "https://emi.ea.govt.nz/Wholesale/Datasets/Generation/Generation_MD/"
     
-    for m in sorted(list(set(months_needed))):
+    for m in sorted(set(months_needed)):
         url = f"{base_url}{m}_Generation_MD.csv"
         try:
             r = requests.get(url, timeout=20)
             if r.status_code == 200:
                 df = pd.read_csv(io.StringIO(r.text), low_memory=False)
                 date_col = next((c for c in df.columns if 'date' in c.lower()), None)
-                if date_col: df['Trading_Date'] = pd.to_datetime(df[date_col])
+                if date_col:
+                    df['Trading_Date'] = pd.to_datetime(df[date_col])
                 all_data.append(df)
-        except: continue
-            
-    if not all_data: return None
+        except:
+            continue
+    if not all_data:
+        return None
     df = pd.concat(all_data, ignore_index=True)
-    
-    # Process to Hourly
     tp_cols = [c for c in df.columns if c.startswith('TP')]
     id_cols = [c for c in df.columns if c not in tp_cols]
     df_long = df.melt(id_vars=id_cols, value_vars=tp_cols, var_name='TP', value_name='kwh')
-    
     df_long['TP_num'] = df_long['TP'].str.extract(r'(\d+)').astype(float)
     df_long['datetime'] = df_long['Trading_Date'] + pd.to_timedelta((df_long['TP_num']-1)*30, unit='m')
     df_long['mw'] = pd.to_numeric(df_long['kwh'], errors='coerce') / 500
-    
     df_long['hour'] = df_long['datetime'].dt.floor('H')
     df_hourly = df_long.groupby('hour')['mw'].sum().reset_index()
     df_hourly.columns = ['datetime', 'generation_mw']
-    
     return df_hourly
+
 
 @st.cache_data(ttl=3600)
 def load_nz_prices():
-    """Loads last 30 days of NZ Final Energy Prices."""
+    """Loads last 30 days of Benmore spot prices — robust daily loader."""
     now = pd.Timestamp.now()
-    # Load last 30 days
-    dates_needed = [now - pd.DateOffset(days=i) for i in range(30)]
+    dates_needed = [now - pd.DateOffset(days=i) for i in range(35)]   # extra buffer
     all_data = []
     base_url = "https://www.emi.ea.govt.nz/Wholesale/Datasets/DispatchAndPricing/FinalEnergyPrices/"
     
-    # Progress bar for user experience
-    progress_bar = st.progress(0, text="Loading price data...")
-    
-    for i, d in enumerate(dates_needed):
+    for d in dates_needed:
         filename = d.strftime('%Y%m%d_FinalEnergyPrices.csv')
         url = f"{base_url}{filename}"
         try:
-            r = requests.get(url, timeout=10)
-            if r.status_code == 200:
-                # Read header to find columns
-                df_cols = pd.read_csv(io.StringIO(r.text), nrows=1)
-                
-                # Try to find the Benmore column (BEN2201) or fall back to a generic 'Price' column if exists
-                # Common columns: BEN2201, BEN2202, or sometimes just 'Price' in reference files
-                price_col = None
-                possible_cols = ['BEN2201', 'BEN2202', 'Price', 'Price_BEN']
-                for pc in possible_cols:
-                    if pc in df_cols.columns:
-                        price_col = pc
-                        break
-                
-                # If still not found, try partial match for BEN
-                if not price_col:
-                    price_col = next((c for c in df_cols.columns if 'BEN' in c), None)
-                
-                if price_col:
-                    # Read only necessary columns
-                    df = pd.read_csv(io.StringIO(r.text), usecols=['Trading_Date', 'Trading_Period', price_col])
-                    df['datetime'] = pd.to_datetime(df['Trading_Date']) + pd.to_timedelta((df['Trading_Period'] - 1) * 30, unit='m')
-                    df = df.rename(columns={price_col: 'price'})
-                    df = df[df['price'] > 0] # Filter invalid
-                    df['hour'] = df['datetime'].dt.floor('H')
-                    df_hourly = df.groupby('hour')['price'].mean().reset_index()
-                    all_data.append(df_hourly)
+            r = requests.get(url, timeout=15)
+            if r.status_code != 200:
+                continue
+            # Read only header first
+            df_cols = pd.read_csv(io.StringIO(r.text), nrows=1)
+            
+            # Smart column detection for Benmore price
+            price_col = None
+            for candidate in ['BEN2201', 'BEN2201_Price', 'Price', 'BEN2202', 'Price_BEN']:
+                if candidate in df_cols.columns:
+                    price_col = candidate
+                    break
+            if not price_col:
+                price_col = next((c for c in df_cols.columns if 'BEN' in c.upper()), None)
+            
+            if price_col:
+                df = pd.read_csv(io.StringIO(r.text), usecols=['Trading_Date', 'Trading_Period', price_col])
+                df['datetime'] = pd.to_datetime(df['Trading_Date']) + pd.to_timedelta((df['Trading_Period'] - 1) * 30, unit='m')
+                df = df.rename(columns={price_col: 'price'})
+                df = df[df['price'] > 0]
+                df['hour'] = df['datetime'].dt.floor('H')
+                df_hourly = df.groupby('hour')['price'].mean().reset_index()
+                all_data.append(df_hourly)
         except:
             continue
-        progress_bar.progress((i+1) / len(dates_needed), text=f"Checking {d.strftime('%Y-%m-%d')}...")
-    
-    progress_bar.empty()
     
     if not all_data:
         return None
     df_final = pd.concat(all_data, ignore_index=True)
     return df_final[['hour', 'price']].rename(columns={'hour': 'datetime', 'price': 'spot_price'})
 
-# --- 2. CORE LOGIC ---
 
-def calculate_stress_signal(df, gen_col='generation_mw'):
+# ==================== CORE LOGIC ====================
+def calculate_stress_signal(df):
     df = df.copy()
-    df['baseline'] = df[gen_col].rolling(48, min_periods=24).mean().shift(24)
-    df['deficit'] = (df['baseline'] - df[gen_col]).clip(lower=0) / df['baseline']
-    df['loss_rate'] = (-df[gen_col].diff()).clip(lower=0) / df['baseline']
+    df['baseline'] = df['generation_mw'].rolling(48, min_periods=24).mean().shift(24)
+    df['deficit'] = (df['baseline'] - df['generation_mw']).clip(lower=0) / df['baseline']
+    df['loss_rate'] = (-df['generation_mw'].diff()).clip(lower=0) / df['baseline']
     df['stress'] = 10 * df['deficit'] + 5 * df['loss_rate']
     return df
+
 
 def get_sensitivity_threshold(df, level):
     mean = df['stress'].mean()
     std = df['stress'].std()
-    # Map 1-10 to Z-score 3.5 down to 0.5
     z = 3.5 - ((level - 1) * (3.0 / 9))
     return mean + (z * std)
 
-# --- 3. DASHBOARD UI ---
 
+# ==================== DASHBOARD ====================
 def main():
     st.title("🇳🇿 NZ Grid Stress Monitor – Trader Edition")
-    st.caption("Live generation-deficit signal • Sensitivity slider • Real price correlation")
-    
-    # Load Data
-    df_gen = load_nz_generation()
-    df_prices = load_nz_prices()
-    
+    st.caption("Live generation-deficit signal • Sensitivity slider • Real Benmore price correlation")
+
+    with st.spinner("Fetching latest generation & price data..."):
+        df_gen = load_nz_generation()
+        df_prices = load_nz_prices()
+
     if df_gen is None:
         st.error("Failed to load generation data.")
         return
-        
+
     df = calculate_stress_signal(df_gen)
     df = df.dropna(subset=['stress'])
-    
-    # Merge Prices
+
+    # Merge real prices
     if df_prices is not None:
         df = df.merge(df_prices, on='datetime', how='left')
     else:
         df['spot_price'] = np.nan
-        st.warning("Could not load live price data (EMI server might be updating).")
-    
-    # SIDEBAR
+        st.warning("⚠️ Price data temporarily unavailable (EMI may be updating files).")
+
+    # SIDEBAR – Your exact knob
     st.sidebar.header("Settings")
-    
-    # Polished Slider (Fixed Labels)
     sensitivity = st.sidebar.slider(
-        "Sensitivity", 
+        "Sensitivity",
         1, 10, 5,
         format="Level %d",
-        help="1 = Dull (Fewer Alerts) | 10 = Sensitive (More Alerts)"
+        help="1 = Dull (very high certainty, few alerts) | 10 = Sensitive (more alerts, more noise)"
     )
-    
-    st.sidebar.markdown("**1 = Dull**\n\n**10 = Sensitive**")
-    
+    st.sidebar.markdown("**1 = Dull**  **10 = Sensitive**")
+
     threshold = get_sensitivity_threshold(df, sensitivity)
-    
+
     # TOP METRICS
     col1, col2, col3 = st.columns(3)
     latest = df.iloc[-1]
-    
     with col1:
         st.metric("Current Stress", f"{latest['stress']:.2f}")
     with col2:
         status = "⚠️ STRESS ALERT" if latest['stress'] > threshold else "✅ NORMAL"
         st.metric("Status", status)
     with col3:
-        price_val = latest['spot_price']
-        st.metric("Current Price ($/MWh)", f"{price_val:.1f}" if pd.notna(price_val) else "N/A")
-        
-    # MAIN CHART
+        price_val = latest.get('spot_price')
+        st.metric("Current Benmore Price ($/MWh)", f"{price_val:.1f}" if pd.notna(price_val) else "N/A")
+
+    # CHART
     st.header("Stress Signal vs Threshold")
-    
     fig = go.Figure()
-    
-    # Stress Line
-    fig.add_trace(go.Scatter(
-        x=df['datetime'], y=df['stress'],
-        mode='lines', name='Stress', line=dict(color='#1f77b4', width=2)
-    ))
-    
-    # Threshold Line
-    fig.add_trace(go.Scatter(
-        x=df['datetime'], y=[threshold]*len(df),
-        mode='lines', name='Threshold', line=dict(color='red', dash='dash')
-    ))
-    
-    # Spikes
-    spikes = df[df['stress'] > threshold].copy()
-    fig.add_trace(go.Scatter(
-        x=spikes['datetime'], y=spikes['stress'],
-        mode='markers', name='Alert', marker=dict(color='red', size=8)
-    ))
-    
+    fig.add_trace(go.Scatter(x=df['datetime'], y=df['stress'], mode='lines', name='Stress', line=dict(color='#1f77b4', width=2)))
+    fig.add_trace(go.Scatter(x=df['datetime'], y=[threshold]*len(df), mode='lines', name='Threshold', line=dict(color='red', dash='dash')))
+    spikes = df[df['stress'] > threshold]
+    fig.add_trace(go.Scatter(x=spikes['datetime'], y=spikes['stress'], mode='markers', name='Alert', marker=dict(color='red', size=8)))
     fig.update_layout(template="plotly_white", height=400, hovermode="x unified")
     st.plotly_chart(fig, use_container_width=True)
-    
-    # --- BACKTEST PANEL ---
+
+    # IMPACT ANALYSIS
     st.header("Stress Impact Analysis")
     st.markdown("**Real historical price premium** when stress > threshold (last 30 days)")
-
     if 'spot_price' in df.columns and not df['spot_price'].isna().all():
-        high_stress = df[df['stress'] > threshold]
-        normal_stress = df[df['stress'] <= threshold]
-        
-        if not high_stress.empty:
-            avg_price_spike = high_stress['spot_price'].mean()
-            avg_price_norm = normal_stress['spot_price'].mean()
-            
+        high = df[df['stress'] > threshold]
+        normal = df[df['stress'] <= threshold]
+        if not high.empty:
+            avg_spike = high['spot_price'].mean()
+            avg_norm = normal['spot_price'].mean()
             c1, c2 = st.columns(2)
-            with c1:
-                st.metric("Avg Price (During Alert)", f"${avg_price_spike:.1f}")
-            with c2:
-                st.metric("Avg Price (Normal)", f"${avg_price_norm:.1f}")
-                
-            if avg_price_norm > 0:
-                premium = ((avg_price_spike - avg_price_norm) / avg_price_norm * 100)
+            with c1: st.metric("Avg Price (During Alert)", f"${avg_spike:.1f}")
+            with c2: st.metric("Avg Price (Normal)", f"${avg_norm:.1f}")
+            if avg_norm > 0:
+                premium = ((avg_spike - avg_norm) / avg_norm * 100)
                 st.success(f"Price premium during stress events: {premium:.1f}%")
         else:
-            st.info("No alerts at this sensitivity level to analyze.")
+            st.info("No alerts at this sensitivity level.")
     else:
         st.error("Price data unavailable for analysis.")
 
-    # --- EXPORT BUTTON ---
+    # EXPORT
     st.subheader("Export Data")
-    # Only export if we have data
     export_df = spikes[['datetime', 'stress', 'spot_price']].dropna()
     if not export_df.empty:
         csv = export_df.to_csv(index=False).encode('utf-8')
-        st.download_button(
-            "Download Alert History (CSV)",
-            data=csv,
-            file_name='nz_stress_alerts.csv',
-            mime='text/csv',
-        )
+        st.download_button("Download Alert History (CSV)", csv, "nz_stress_alerts.csv", "text/csv")
     else:
         st.info("No alerts to export yet.")
 
-    # --- HOW IT WORKS (New Section) ---
+    # HOW IT WORKS
     with st.expander("How It Works (Methodology)"):
         st.markdown("""
-        **The Stress Signal:**
-        The core detection engine uses a proprietary combination of generation deficit and loss rate.
-        
-        **Formula:**
-        `stress(t) = 10 × deficit(t) + 5 × loss_rate(t)`
-        
-        **Components:**
-        - **Deficit:** Measures the shortfall between Actual Generation and a 48-hour Rolling Baseline.
-        - **Loss Rate:** Measures the speed of generation decline.
-        
-        **Interpretation:**
-        - When **Stress > Threshold**, the grid is experiencing a generation shortfall relative to recent history.
-        - **Sensitivity 1 (Dull):** Only flags extreme events (High Precision).
-        - **Sensitivity 10 (Sensitive):** Flags minor fluctuations (High Recall).
-        
-        **Data Source:**
-        NZ Electricity Authority (EMI Portal) - Generation_MD & FinalEnergyPrices.
+        **The Stress Signal:**  
+        `stress(t) = 10 × deficit(t) + 5 × loss_rate(t)`  
+        - **Deficit** = shortfall vs 48-hour rolling baseline  
+        - **Loss Rate** = speed of generation decline  
+        **Sensitivity knob:** 1 = Dull (high certainty)  10 = Sensitive (more noise)
+        Data from Electricity Authority EMI Portal.
         """)
 
 if __name__ == "__main__":

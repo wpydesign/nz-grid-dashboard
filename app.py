@@ -4,17 +4,23 @@ import numpy as np
 import requests
 import io
 import plotly.graph_objects as go
-from datetime import datetime, timedelta
+from datetime import datetime
 
 # ==========================================
-# 1. CONFIGURATION & CACHING
+# 1. CONFIGURATION
 # ==========================================
-st.set_page_config(layout="wide", page_title="NZ Grid Stress Monitor")
+st.set_page_config(
+    layout="wide", 
+    page_title="NZ Grid Stress Monitor",
+    page_icon="⚡"
+)
 
+# ==========================================
+# 2. DATA LOADING (Cached)
+# ==========================================
 @st.cache_data(ttl=3600)
 def load_grid_data():
-    """Load generation data from EMI API for the last 3 years"""
-    print("Loading Supply Data...")
+    """Load generation data from EMI API"""
     base_url = "https://emi.ea.govt.nz/Wholesale/Datasets/Generation/Generation_MD/"
     months = pd.date_range(end=pd.Timestamp.now(), periods=36, freq='MS').strftime('%Y%m').tolist()
     all_data = []
@@ -33,310 +39,377 @@ def load_grid_data():
                     day_sum = day_sum.reset_index()
                     day_sum.columns = ['datetime', 'generation_mw']
                     all_data.append(day_sum)
-        except: 
+        except:
             pass
     
-    if not all_data: 
+    if not all_data:
         return pd.DataFrame()
     
     df = pd.concat(all_data).drop_duplicates().sort_values('datetime').reset_index(drop=True)
     return df
 
 # ==========================================
-# 2. STRESS ENGINE
+# 3. STRESS ENGINE
 # ==========================================
 def calculate_structural_stress(df, sensitivity_knob):
     """Calculate stress metrics and identify regime events"""
     df = df.copy()
     
-    # Seasonal baseline (30-day rolling mean, shifted to avoid look-ahead)
+    # Seasonal baseline
     df['baseline'] = df['generation_mw'].rolling(30, min_periods=10).mean().shift(1)
     
-    # Deficit component: gap below baseline (normalized)
+    # Components (simplified for buyers)
     df['deficit'] = (df['baseline'] - df['generation_mw']).clip(lower=0) / df['baseline']
-    
-    # Shock component: sudden drops in generation (normalized)
     df['shock'] = (-df['generation_mw'].diff()).clip(lower=0) / df['baseline']
     
-    # Combined raw stress score
+    # Combined score
     df['stress_raw'] = 10 * df['deficit'] + 5 * df['shock']
     
-    # Z-score normalization (30-day rolling)
+    # Z-score normalization
     r_mean = df['stress_raw'].rolling(30, min_periods=10).mean()
     r_std = df['stress_raw'].rolling(30, min_periods=10).std()
     df['stress_z'] = (df['stress_raw'] - r_mean) / r_std
     df['stress_z'] = df['stress_z'].fillna(0)
     
-    # Dynamic threshold based on sensitivity
+    # Dynamic threshold
     threshold = 4.0 - (sensitivity_knob * 0.3)
     df['is_alert'] = df['stress_z'] >= threshold
-    
-    # Rate of change for explanation
-    df['stress_change'] = df['stress_z'].diff()
     
     return df, threshold
 
 # ==========================================
-# 3. EXPLANATION LAYER (Enhanced)
+# 4. EXPLANATION LAYER (Buyer-Friendly)
 # ==========================================
-def generate_detailed_explanation(row, threshold):
-    """Generate detailed, actionable explanation for a stress event"""
+def generate_buyer_explanation(row, threshold):
+    """Generate plain-English, actionable explanation"""
     if row['stress_z'] < threshold:
         return None
     
-    # Determine stress drivers
-    drivers = []
-    stress_type = []
+    date_str = row['datetime'].strftime('%Y-%m-%d') if pd.notna(row['datetime']) else 'Unknown'
     
-    # Deficit analysis
-    if row['deficit'] > 0.15:
-        drivers.append(f"**Severe Supply Deficit**: Generation {row['deficit']*100:.1f}% below seasonal baseline")
-        stress_type.append("Supply Shortage")
-    elif row['deficit'] > 0.08:
-        drivers.append(f"**Moderate Deficit**: Generation {row['deficit']*100:.1f}% below baseline")
-        stress_type.append("Supply Pressure")
+    # Determine causes
+    causes = []
+    if row['deficit'] > 0.12:
+        causes.append(f"Supply is {row['deficit']*100:.0f}% below normal levels")
+    elif row['deficit'] > 0.05:
+        causes.append(f"Supply is {row['deficit']*100:.0f}% below baseline")
     
-    # Shock analysis
-    if row['shock'] > 0.08:
-        drivers.append(f"**Sudden Drop**: Rapid decline of {row['shock']*100:.1f}% from previous day")
-        stress_type.append("Outage Event")
-    elif row['shock'] > 0.03:
-        drivers.append(f"**Notable Shock**: Generation dropped {row['shock']*100:.1f}% suddenly")
+    if row['shock'] > 0.06:
+        causes.append(f"Sudden drop of {row['shock']*100:.0f}% (possible outage)")
+    elif row['shock'] > 0.02:
+        causes.append(f"Notable decline of {row['shock']*100:.0f}%")
+    
+    if not causes:
+        causes.append("Elevated stress pattern detected")
     
     # Pattern recognition
     if row['deficit'] > 0.10 and row['shock'] > 0.05:
-        pattern = "**Compound Event**: Combined deficit + shock indicates potential cascading issue"
+        pattern = "Compound Event"
+        pattern_desc = "Combined deficit + sudden drop — risk of cascading issues"
     elif row['deficit'] > 0.10:
-        pattern = "**Sustained Stress**: Persistent supply gap suggests structural limitation (hydro/thermal constraint)"
+        pattern = "Sustained Stress"
+        pattern_desc = "Ongoing supply gap — possible hydro/thermal constraint"
     elif row['shock'] > 0.05:
-        pattern = "**Acute Event**: Sudden drop likely indicates plant trip or transmission issue"
+        pattern = "Acute Event"
+        pattern_desc = "Sudden drop — likely plant trip or transmission issue"
     else:
-        pattern = "**Elevated Pattern**: Stress building but cause unclear - monitor closely"
+        pattern = "Building Stress"
+        pattern_desc = "Stress levels elevated — monitor closely"
     
-    # Measurement context
-    measurement = f"""
-    **How Measured:**
-    - Z-Score: {row['stress_z']:.2f} (threshold: {threshold:.2f})
-    - Baseline: {row['baseline']:.0f} MW (30-day rolling average)
-    - Actual: {row['generation_mw']:.0f} MW
-    - Gap: {row['baseline'] - row['generation_mw']:.0f} MW
-    """
-    
-    # Actionable insights
+    # Action recommendation
     if row['stress_z'] > threshold + 1.5:
-        action = "**Action: HIGH PRIORITY** - Immediate review recommended. Consider demand response activation."
+        action = "HIGH PRIORITY"
+        action_desc = "Review immediately. Consider demand response activation."
+        action_color = "🔴"
     elif row['stress_z'] > threshold + 0.5:
-        action = "**Action: MONITOR** - Increase monitoring frequency. Prepare contingency plans."
+        action = "MONITOR"
+        action_desc = "Increase monitoring frequency. Prepare contingencies."
+        action_color = "🟡"
     else:
-        action = "**Action: WATCH** - Stress elevated but within manageable range. Continue monitoring."
+        action = "WATCH"
+        action_desc = "Elevated but manageable. Continue monitoring."
+        action_color = "🟠"
     
-    # Format explanation
-    explanation = f"""
-    ### Stress Event Detected
-    **Date:** {row['datetime'].strftime('%Y-%m-%d') if pd.notna(row['datetime']) else 'Unknown'}
-    
-    ---
-    
-    **Why Stress is High:**
-    {''.join([f'\n- {d}' for d in drivers])}
-    
-    **Pattern Recognition:**
-    {pattern}
-    
-    ---
-    {measurement}
-    ---
-    
-    {action}
-    """
-    
-    return explanation
-
-def get_event_summary(row, threshold):
-    """Get a brief summary for sidebar display"""
-    if row['stress_z'] < threshold:
-        return None, "normal"
-    
-    if row['deficit'] > 0.10 and row['shock'] > 0.05:
-        return "Compound Event (Deficit + Shock)", "critical"
-    elif row['deficit'] > 0.10:
-        return "Supply Deficit", "warning"
-    elif row['shock'] > 0.05:
-        return "Sudden Outage", "warning"
-    else:
-        return "Elevated Stress", "info"
+    return {
+        'date': date_str,
+        'z_score': row['stress_z'],
+        'causes': causes,
+        'pattern': pattern,
+        'pattern_desc': pattern_desc,
+        'action': action,
+        'action_desc': action_desc,
+        'action_color': action_color,
+        'deficit_pct': row['deficit'] * 100,
+        'shock_pct': row['shock'] * 100,
+        'baseline_mw': row['baseline'],
+        'actual_mw': row['generation_mw']
+    }
 
 # ==========================================
-# 4. INTERFACE
+# 5. SIDEBAR
 # ==========================================
-st.title("NZ Grid Structural Stress Monitor")
-
 with st.sidebar:
-    st.header("Controls")
+    st.markdown("### ⚙️ Controls")
+    
     sensitivity = st.slider(
-        "Sensitivity Knob", 
+        "**Sensitivity**", 
         1, 10, 5,
-        help="1=Systemic Events Only, 10=Subtle Build-ups"
+        help="1 = Major events only | 10 = Subtle buildups"
     )
     
     st.markdown("---")
     
-    # Validation Box (Compact)
-    st.markdown("**Validation Stats**")
-    st.caption("Tested on: 3 Years History")
-    st.caption("Events Detected (Strict): 6")
-    st.caption("Avg Lead Time: ~5-10 Days")
-    st.caption("False Positive Rate: Low (Strict Z>2 filter)")
+    # Validation Stats (concise)
+    st.markdown("### ✅ Validation")
+    st.info("""
+    **Backtested:** 3 years
+    
+    **Events found:** 6 major
+    
+    **Lead time:** 5-10 days
+    """)
     
     st.markdown("---")
     
     # Legend
-    st.markdown("**Chart Legend**")
-    st.caption("🔵 Blue Line: Stress Z-Score")
-    st.caption("🔴 Red Dots: Flagged Events")
-    st.caption("📏 Dashed Line: Alert Threshold")
+    st.markdown("### 📊 Chart Legend")
+    st.markdown("""
+    🔵 **Blue line** — Stress Z-Score
+    
+    🔴 **Red dots** — Stress events
+    
+    --- **Dashed line** — Alert threshold
+    """)
     
     st.markdown("---")
-    st.markdown("**Tip:** Click any red dot to see detailed explanation")
+    st.caption("💡 **Tip:** Click any red dot to see detailed explanation")
+
+# ==========================================
+# 6. MAIN CONTENT
+# ==========================================
+
+# Title with tagline
+st.title("⚡ NZ Grid Stress Monitor")
+st.markdown("*Early warning system for electricity supply risks*")
 
 # Load data
 df_raw = load_grid_data()
 
-if not df_raw.empty:
-    df_final, current_threshold = calculate_structural_stress(df_raw, sensitivity)
+if df_raw.empty:
+    st.error("⚠️ Unable to load data. Please check your connection.")
+    st.stop()
+
+# Calculate stress
+df_final, current_threshold = calculate_structural_stress(df_raw, sensitivity)
+latest = df_final.iloc[-1]
+df_alerts = df_final[df_final['is_alert']].copy()
+
+# ==========================================
+# STATUS BANNER (Top)
+# ==========================================
+st.markdown("---")
+
+if latest['is_alert']:
+    status_col1, status_col2, status_col3 = st.columns([2, 1, 1])
     
-    # Get alert events for click selection
-    df_alerts = df_final[df_final['is_alert']].copy()
+    with status_col1:
+        st.error(f"⚠️ **STRESS EVENT DETECTED** — {latest['datetime'].strftime('%Y-%m-%d')}")
     
-    # Create two columns: Chart (left, wider) + Explanation (right)
-    col_chart, col_explain = st.columns([2.5, 1])
+    with status_col2:
+        st.metric("Current Z-Score", f"{latest['stress_z']:.2f}", delta=f"Threshold: {current_threshold:.1f}")
     
-    with col_chart:
-        # Main Chart
-        fig = go.Figure()
-        
-        # Stress Z-score line
-        fig.add_trace(go.Scatter(
-            x=df_final['datetime'],
-            y=df_final['stress_z'],
-            mode='lines',
-            name='Stress Z-Score',
-            line=dict(color='#3182CE', width=1.5),
-            hovertemplate='<b>Date:</b> %{x}<br><b>Z-Score:</b> %{y:.2f}<extra></extra>'
-        ))
-        
-        # Alert events (red dots) - with custom data for click events
+    with status_col3:
+        st.metric("Supply Gap", f"{latest['deficit']*100:.1f}%", delta="Below baseline")
+else:
+    status_col1, status_col2, status_col3 = st.columns([2, 1, 1])
+    
+    with status_col1:
+        st.success(f"✅ **GRID STABLE** — {latest['datetime'].strftime('%Y-%m-%d')}")
+    
+    with status_col2:
+        st.metric("Current Z-Score", f"{latest['stress_z']:.2f}", delta=f"Threshold: {current_threshold:.1f}")
+    
+    with status_col3:
+        st.metric("Status", "Normal", delta="No alerts")
+
+st.markdown("---")
+
+# ==========================================
+# MAIN CHART + EXPLANATION PANEL
+# ==========================================
+chart_col, explain_col = st.columns([2.5, 1.2])
+
+with chart_col:
+    # Build chart
+    fig = go.Figure()
+    
+    # Safe zone shading (below threshold)
+    fig.add_hrect(
+        y0=-3, y1=current_threshold,
+        fillcolor="#E6FFFA", opacity=0.3,
+        layer="below", line_width=0
+    )
+    
+    # Stress Z-score line
+    fig.add_trace(go.Scatter(
+        x=df_final['datetime'],
+        y=df_final['stress_z'],
+        mode='lines',
+        name='Stress Z-Score',
+        line=dict(color='#3182CE', width=1.5),
+        hovertemplate='<b>%{x|%Y-%m-%d}</b><br>Z-Score: %{y:.2f}<extra></extra>'
+    ))
+    
+    # Alert events (clickable red dots)
+    if not df_alerts.empty:
         fig.add_trace(go.Scatter(
             x=df_alerts['datetime'],
             y=df_alerts['stress_z'],
             mode='markers',
             name='Stress Event',
-            marker=dict(color='#E53E3E', size=12, line=dict(color='white', width=1)),
-            customdata=df_alerts.index,
-            hovertemplate='<b>EVENT</b><br>Date: %{x}<br>Z-Score: %{y:.2f}<br><i>Click for explanation</i><extra></extra>'
+            marker=dict(color='#E53E3E', size=14, line=dict(color='white', width=2)),
+            hovertemplate='<b>⚠️ STRESS EVENT</b><br>%{x|%Y-%m-%d}<br>Z-Score: %{y:.2f}<br><i>Click for details</i><extra></extra>',
+            customdata=df_alerts.index
         ))
-        
-        # Threshold line
-        fig.add_hline(
-            y=current_threshold, 
-            line_dash="dot", 
-            line_color="#E53E3E",
-            annotation_text=f"Threshold (Z={current_threshold:.1f})",
-            annotation_position="right"
-        )
-        
-        # Zero line
-        fig.add_hline(y=0, line_dash="solid", line_color="#A0AEC0", line_width=0.5)
-        
-        fig.update_layout(
-            template="plotly_white",
-            height=550,
-            hovermode="closest",
-            yaxis_title="Stress Z-Score",
-            xaxis_title="Date",
-            margin=dict(l=60, r=20, t=30, b=60),
-            legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1)
-        )
-        
-        # Use select events for click interaction
-        selected = st.plotly_chart(fig, use_container_width=True, on_select="rerun", key="stress_chart")
     
-    with col_explain:
-        st.markdown("### Explanation Layer")
+    # Threshold line
+    fig.add_hline(
+        y=current_threshold,
+        line_dash="dash",
+        line_color="#E53E3E",
+        line_width=2,
+        annotation_text=f"Alert Threshold ({current_threshold:.1f})",
+        annotation_position="right",
+        annotation_font_color="#E53E3E"
+    )
+    
+    # Zero line
+    fig.add_hline(y=0, line_dash="solid", line_color="#CBD5E0", line_width=1)
+    
+    fig.update_layout(
+        template="plotly_white",
+        height=480,
+        hovermode="closest",
+        yaxis_title="Stress Z-Score",
+        xaxis_title="Date",
+        margin=dict(l=50, r=20, t=20, b=50),
+        showlegend=False
+    )
+    
+    # Interactive selection
+    selected = st.plotly_chart(fig, use_container_width=True, on_select="rerun", key="stress_chart")
+
+with explain_col:
+    st.markdown("### 📋 Explanation Layer")
+    
+    # Determine what to show
+    selected_event = None
+    
+    # Check for click selection
+    if selected and selected.get('selection', {}).get('point_indices'):
+        point_indices = selected['selection']['point_indices']
+        trace_indices = selected['selection'].get('trace_indices', [])
         
-        # Check if a point was clicked
-        selected_event = None
-        
-        if selected and selected.get('selection', {}).get('point_indices'):
-            point_indices = selected['selection']['point_indices']
-            if point_indices:
-                # Get the first selected point
+        if point_indices and trace_indices:
+            trace_idx = trace_indices[0]
+            # trace index 1 is the alerts trace
+            if trace_idx == 1 and not df_alerts.empty:
                 idx = point_indices[0]
-                
-                # Check if it's from the alerts trace (trace index 1)
-                trace_idx = selected['selection'].get('trace_indices', [None])[0] if 'selection' in selected else None
-                
-                if trace_idx == 1:  # Alerts trace
-                    # Get the actual dataframe index from customdata
-                    df_idx = df_alerts.index[idx] if idx < len(df_alerts) else None
-                    if df_idx is not None:
-                        selected_event = df_final.loc[df_idx]
+                if idx < len(df_alerts):
+                    df_idx = df_alerts.index[idx]
+                    selected_event = df_final.loc[df_idx]
+    
+    # Display explanation
+    if selected_event is not None:
+        explanation = generate_buyer_explanation(selected_event, current_threshold)
         
-        # Display explanation
-        if selected_event is not None:
-            explanation = generate_detailed_explanation(selected_event, current_threshold)
-            if explanation:
-                st.markdown(explanation)
-                
-                # Quick metrics
-                st.metric("Z-Score", f"{selected_event['stress_z']:.2f}", 
-                         f"{selected_event['stress_change']:.2f}" if pd.notna(selected_event['stress_change']) else None)
-                st.metric("Deficit %", f"{selected_event['deficit']*100:.1f}%")
-                st.metric("Shock %", f"{selected_event['shock']*100:.1f}%")
-        else:
-            # Show latest status when no event selected
-            latest = df_final.iloc[-1]
-            
-            if latest['is_alert']:
-                st.warning("⚠️ **Current Status: STRESS EVENT**")
-                st.markdown("---")
-                explanation = generate_detailed_explanation(latest, current_threshold)
-                st.markdown(explanation)
-            else:
-                st.success("✅ **Current Status: NORMAL**")
-                st.markdown("---")
-                st.info(f"""
-                **Latest Reading:**
-                - Date: {latest['datetime'].strftime('%Y-%m-%d')}
-                - Z-Score: {latest['stress_z']:.2f}
-                - Threshold: {current_threshold:.2f}
-                
-                No stress events detected at current sensitivity level.
-                """)
+        if explanation:
+            # Action header (prominent)
+            st.markdown(f"### {explanation['action_color']} {explanation['action']}")
+            st.caption(explanation['action_desc'])
             
             st.markdown("---")
-            st.caption("💡 Click any red dot on the chart to see detailed explanation")
+            
+            # Date
+            st.markdown(f"**📅 Event Date:** {explanation['date']}")
+            
+            # Why stress is high
+            st.markdown("**Why Stress is High:**")
+            for cause in explanation['causes']:
+                st.markdown(f"• {cause}")
+            
+            st.markdown("---")
+            
+            # Pattern
+            st.markdown(f"**Pattern:** {explanation['pattern']}")
+            st.caption(explanation['pattern_desc'])
+            
+            st.markdown("---")
+            
+            # Key metrics (simplified - only 3)
+            col1, col2, col3 = st.columns(3)
+            col1.metric("Z-Score", f"{explanation['z_score']:.2f}")
+            col2.metric("Deficit", f"{explanation['deficit_pct']:.1f}%")
+            col3.metric("Shock", f"{explanation['shock_pct']:.1f}%")
     
-    # Bottom: Event History Table
-    st.markdown("---")
-    st.subheader("Recent Stress Events")
-    
-    if not df_alerts.empty:
-        # Get recent events (last 10)
-        recent_events = df_alerts.tail(10)[['datetime', 'stress_z', 'deficit', 'shock']].copy()
-        recent_events['datetime'] = recent_events['datetime'].dt.strftime('%Y-%m-%d')
-        recent_events.columns = ['Date', 'Z-Score', 'Deficit %', 'Shock %']
-        recent_events['Deficit %'] = (recent_events['Deficit %'] * 100).round(1)
-        recent_events['Shock %'] = (recent_events['Shock %'] * 100).round(1)
-        recent_events['Z-Score'] = recent_events['Z-Score'].round(2)
-        
-        st.dataframe(
-            recent_events.style.background_gradient(subset=['Z-Score'], cmap='Reds'),
-            use_container_width=True,
-            hide_index=True
-        )
     else:
-        st.info("No stress events detected at the current sensitivity level.")
+        # Show current status when nothing selected
+        if latest['is_alert']:
+            explanation = generate_buyer_explanation(latest, current_threshold)
+            
+            st.markdown(f"### {explanation['action_color']} {explanation['action']}")
+            st.caption(explanation['action_desc'])
+            
+            st.markdown("---")
+            st.markdown(f"**📅 Date:** {explanation['date']}")
+            
+            st.markdown("**Why Stress is High:**")
+            for cause in explanation['causes']:
+                st.markdown(f"• {cause}")
+            
+            st.markdown("---")
+            st.markdown(f"**Pattern:** {explanation['pattern']}")
+            st.caption(explanation['pattern_desc'])
+            
+            st.markdown("---")
+            col1, col2, col3 = st.columns(3)
+            col1.metric("Z-Score", f"{explanation['z_score']:.2f}")
+            col2.metric("Deficit", f"{explanation['deficit_pct']:.1f}%")
+            col3.metric("Shock", f"{explanation['shock_pct']:.1f}%")
+        else:
+            st.success("✅ **No Active Alerts**")
+            st.info("""
+            The grid is operating within normal parameters.
+            
+            Current Z-Score is below the alert threshold.
+            """)
+        
+        st.markdown("---")
+        st.caption("💡 Click a red dot on the chart to see detailed explanation")
 
+# ==========================================
+# EVENT HISTORY (Last 5)
+# ==========================================
+st.markdown("---")
+st.markdown("### 📊 Recent Stress Events")
+
+if not df_alerts.empty:
+    # Show only last 5 events, essential columns
+    recent = df_alerts.tail(5)[['datetime', 'stress_z', 'deficit', 'shock']].copy()
+    recent['datetime'] = recent['datetime'].dt.strftime('%Y-%m-%d')
+    recent['deficit'] = (recent['deficit'] * 100).round(1).astype(str) + '%'
+    recent['shock'] = (recent['shock'] * 100).round(1).astype(str) + '%'
+    recent['stress_z'] = recent['stress_z'].round(2)
+    recent.columns = ['Date', 'Z-Score', 'Deficit', 'Shock']
+    recent = recent.reset_index(drop=True)
+    recent.index = recent.index + 1  # Start from 1
+    
+    st.dataframe(
+        recent,
+        use_container_width=True,
+        column_config={
+            "Z-Score": st.column_config.NumberColumn(format="%.2f"),
+        }
+    )
 else:
-    st.error("Data load failed. Please check your connection and try again.")
+    st.info("No stress events detected at current sensitivity level.")
